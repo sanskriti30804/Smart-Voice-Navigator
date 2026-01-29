@@ -14,11 +14,11 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from dataclasses import dataclass, field
 from typing import Optional, Annotated
 from pydantic import Field
-from torch import embedding
-import yaml
 from ultralytics import YOLO
 from sentence_transformers import SentenceTransformer, util
 import os
+import json
+import asyncio
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -38,9 +38,9 @@ class UserData:
             "user_location": self.user_location or "unknown",
             "object_found": self.object_found,
             "object_image": self.object_image or "no image",
-            "prev_agent": self.prev_agent or "no previous agent"
+            "prev_agent": self.prev_agent.__class__.__name__ if self.prev_agent else "no previous agent"
         }
-        return yaml.dump(data)
+        return json.dumps(data, indent=2)
 
 RunContext_T = RunContext[UserData]
 
@@ -132,15 +132,21 @@ class Greeting(BaseAgent):
 
 class ObjectDetectionAgent(BaseAgent):
     def __init__(self) -> None:
-
         super().__init__(
             instructions=(
                 "You handle rapid object detection. Use the latest image and target name from userdata"
             ),
         )
+        # Load models once at startup to avoid re-loading latency
+        logger.info("Loading YOLO and Embedding models...")
+        self.yolo_model = YOLO("yolo11n.pt")
+        self.embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        logger.info("Models loaded.")
     
     async def on_enter(self) -> None:
         await super().on_enter()
+        
+        # Run detection
         message = await self._run_detection() 
         await self.session.say(message)
      
@@ -148,48 +154,60 @@ class ObjectDetectionAgent(BaseAgent):
         userdata = self.session.userdata if context is None else context.userdata
         target = userdata.object_to_find
 
-        model = YOLO("yolo11n.pt")
-        embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        if not target:
+            return "I don't know what object to look for."
+        
+        def run_yolo():
+            return self.yolo_model(userdata.object_image)
 
-        results = model(userdata.object_image)
+        results = await asyncio.to_thread(run_yolo)
 
+        names = []
         for result in results:
-            names = [result.names[cls.item()] for cls in result.boxes.cls.int()]
-        logger.info(f"Predicted Object list from the list: {names}")
+            if result.boxes:
+                # Extract class names safely
+                names = [result.names[int(cls)] for cls in result.boxes.cls.tolist()]
+        
+        logger.info(f"Predicted Object list: {names}")
 
-        query_embedding = embedding_model.encode(target, convert_to_tensor=True)
-        predicted_embeddings = embedding_model.encode(names, convert_to_tensor=True)
+        if not names:
+            userdata.object_found = False
+            return f"I didn't spot any objects. Should I check the knowledge base?"
 
-        similarities = util.cos_sim(query_embedding, predicted_embeddings)[0]
+        def calculate_similarity():
+            query_embedding = self.embedding_model.encode(target, convert_to_tensor=True)
+            predicted_embeddings = self.embedding_model.encode(names, convert_to_tensor=True)
+            return util.cos_sim(query_embedding, predicted_embeddings)[0]
+
+        similarities = await asyncio.to_thread(calculate_similarity)
+        
         best_idx = int(similarities.argmax())
         best_match = names[best_idx]
         best_score = float(similarities[best_idx])
 
         logger.info(f"Best match: {best_match} (Score: {best_score:.3f})")
 
-        if best_score >= 0.6:
+        if best_score >= 0.5: # Adjusted threshold
             userdata.object_found = True
             return (
-                f"I have found {best_match}, which matches your request for {target}. Want me to estiamte the distance?"
+                f"I found {best_match}, which looks like your {target}. Want me to estimate the distance?"
             )
+        
         userdata.object_found = False
         return (
-            f"Didn't spot {target} in the current frame. Should I pull up the knowledge base to guide you?"
+            f"I see {', '.join(names[:3])}, but nothing matching {target}. Should I check the knowledge base?"
         )
 
     @function_tool()
     async def detect_object(self, context: RunContext_T) -> tuple[Agent, str]:
-        """Called when user wants to detect the object"""
         return await self._run_detection(context)
     
     @function_tool()
     async def to_depth_estimation(self, context: RunContext_T) -> tuple[Agent, str]:
-        """Called when user wants to estimate the distance to the object"""
         return await self._transfer_to_agent("depth_estimation", context)
     
     @function_tool()
     async def to_rag(self, context: RunContext_T) -> tuple[Agent, str]:
-        """Called when user wants to search for the object in the knowledge base"""
         return await self._transfer_to_agent("rag", context)
 
 class RAGAgent(BaseAgent):
@@ -245,7 +263,7 @@ async def entrypoint(ctx: agents.JobContext):
         model="gpt-4o-transcribe",
         language="en",
         ),  
-        llm=google.LLM(model="gemini-2.5-flash"),
+        llm=google.LLM(model="gemini-3-flash-preview"),
         tts=sarvam.TTS(
             target_language_code="en-IN",
             speaker="hitesh"
