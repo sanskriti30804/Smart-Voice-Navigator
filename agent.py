@@ -12,7 +12,7 @@ from livekit.plugins import (
 from livekit.agents.llm import function_tool
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from dataclasses import dataclass, field
-from typing import Optional, Annotated
+from typing import List, Optional, Annotated
 from pydantic import Field
 from ultralytics import YOLO
 from sentence_transformers import SentenceTransformer, util
@@ -21,6 +21,10 @@ import json
 import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
+import torch
+import numpy as np
+from PIL import Image
+from transformers import ZoeDepthForDepthEstimation, ZoeDepthImageProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,7 @@ class UserData:
     user_location: Optional[str] = None
     object_found: bool = False
     object_image: Optional[str] = None
+    detected_box: Optional[List[float]] = None
     prev_agent: Optional[Agent] = None
     agents: dict[str, Agent] = field(default_factory=dict)
 
@@ -155,6 +160,9 @@ class ObjectDetectionAgent(BaseAgent):
         # Run detection
         message = await self._run_detection() 
         await self.session.say(message)
+        
+        # Enable function tool calling for user's next response
+        self.session.generate_reply()
      
     async def _run_detection(self, context: Optional[RunContext_T] = None) -> str:
         userdata = self.session.userdata if context is None else context.userdata
@@ -163,47 +171,51 @@ class ObjectDetectionAgent(BaseAgent):
         if not target:
             return "I don't know what object to look for."
         
-        def run_yolo():
-            return self.yolo_model(userdata.object_image)
+        results = self.yolo_model(userdata.object_image)
 
-        # results = await asyncio.to_thread(run_yolo)
-        results = run_yolo() # trying without thread for now
+        detected_objects = []
 
-        names = []
         for result in results:
             if result.boxes:
-                # Extract class names safely
-                names = [result.names[int(cls)] for cls in result.boxes.cls.tolist()]
+                for box in result.boxes:
+                    cls_id = int(box.cls[0])
+                    name = result.names[cls_id]
+                    # Convert box to simple list [x1, y1, x2, y2]
+                    coords = box.xyxy[0].cpu().numpy().tolist()
+                    detected_objects.append((name, coords))
         
-        logger.info(f"Predicted Object list: {names}")
+        names_only = [obj[0] for obj in detected_objects]
+        logger.info(f"Predicted Object list: {names_only}")
 
-        if not names:
+        if not names_only:
             userdata.object_found = False
             return f"I didn't spot any objects. Should I check the knowledge base?"
 
         def calculate_similarity():
             query_embedding = self.embedding_model.encode(target, convert_to_tensor=True)
-            predicted_embeddings = self.embedding_model.encode(names, convert_to_tensor=True)
+            predicted_embeddings = self.embedding_model.encode(names_only, convert_to_tensor=True)
             return util.cos_sim(query_embedding, predicted_embeddings)[0]
 
         # similarities = await asyncio.to_thread(calculate_similarity)
         similarities = calculate_similarity() # trying without thread for now
         
         best_idx = int(similarities.argmax())
-        best_match = names[best_idx]
+        best_match = names_only[best_idx]
+        best_match_box = detected_objects[best_idx][1]
         best_score = float(similarities[best_idx])
 
         logger.info(f"Best match: {best_match} (Score: {best_score:.3f})")
 
         if best_score >= 0.5: # Adjusted threshold
             userdata.object_found = True
+            userdata.detected_box = best_match_box
             logger.info(f'Object Found: {userdata.object_found}')
             return f"I found {best_match}, which looks like your {target}. Want me to estimate the distance to it?"
         
         userdata.object_found = False
         logger.info(f'Object Found: {userdata.object_found}')
         return (
-            f"I see {', '.join(names[:3])}, but nothing matching {target}. Should I check the knowledge base?"
+            f"I see {', '.join(names_only[:3])}, but nothing matching {target}. Should I check the knowledge base?"
         )
     
     @function_tool()
@@ -227,23 +239,72 @@ class DepthEstimationAgent(BaseAgent):
     def __init__(self) -> None:
         super().__init__(
             instructions=(
-                "You estimate distance to the detected object and provide navigation guidance. "
-                "After providing the distance, ask if the user needs further assistance or wants to search for another object. "
-                "Keep responses brief and actionable."
+                "You handle distance estimation to detected objects. Wait for the depth estimation results. "
+                "After estimation, ask if the user needs further assistance or wants to search for another object. "
+                "Do not speak until estimation is complete."
             ),
         )
+        logger.info("Loading Depth Estimation model...")
+        self.depth_processor = ZoeDepthImageProcessor.from_pretrained("Intel/zoedepth-nyu-kitti")
+        self.depth_model = ZoeDepthForDepthEstimation.from_pretrained("Intel/zoedepth-nyu-kitti").eval()
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.depth_model.to(self.device)
+        logger.info(f"ZoeDepth loaded on {self.device}")
+
     async def on_enter(self) -> None:
         await super().on_enter(generate_reply=False)
         message = await self.estimate_depth()
         await self.session.say(message)
+        
+        # Enable function tool calling for user's next response
+        self.session.generate_reply()
 
     async def estimate_depth(self, context: Optional[RunContext_T] = None) -> str:
         """Called when user wants to estimate the distance to the object"""
         userdata = self.session.userdata if context is None else context.userdata
         object_to_find = userdata.object_to_find
-        image = userdata.object_image
-        predicted_depth = 10
-        return f"{object_to_find} is about {predicted_depth} meters ahead. Close in carefully. Need anything else?" if object_to_find else "Can't gauge distance without a target."
+        image_path = userdata.object_image
+        box = userdata.detected_box # [x1, y1, x2, y2]
+
+        if not object_to_find or not image_path or not box:
+            return "I need a confirmed object detection to gauge distance."
+
+        try:
+            # 1. Load Image
+            pil_image = Image.open(image_path).convert("RGB")
+            
+            # 2. Generate Depth Map
+            inputs = self.depth_processor(images=pil_image, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                outputs = self.depth_model(**inputs)
+            
+            post_processed = self.depth_processor.post_process_depth_estimation(
+                outputs, source_sizes=[(pil_image.height, pil_image.width)]
+            )[0]
+            depth_map = post_processed["predicted_depth"].cpu().numpy()
+
+            # 3. Extract Distance for the specific box
+            x1, y1, x2, y2 = map(int, box)
+            
+            # Clamp coordinates
+            x1, x2 = max(0, x1), min(pil_image.width, x2)
+            y1, y2 = max(0, y1), min(pil_image.height, y2)
+            
+            object_depth_region = depth_map[y1:y2, x1:x2]
+            
+            if object_depth_region.size == 0:
+                 return f"I see the {object_to_find}, but I can't get a clear depth reading."
+
+            # Calculate Median Distance
+            distance = np.median(object_depth_region)
+            distance_str = f"{distance:.2f}"
+
+            return f"The {object_to_find} is about {distance_str} meters away. Close in carefully. Need anything else?"
+
+        except Exception as e:
+            logger.error(f"Depth error: {e}")
+            return "I'm having trouble reading the depth sensors right now."
     
     @function_tool()
     async def search_new_object(self, context: RunContext_T) -> tuple[Agent, str]:
