@@ -162,7 +162,7 @@ class ObjectDetectionAgent(BaseAgent):
         await self.session.say(message)
         
         # Enable function tool calling for user's next response
-        self.session.generate_reply()
+        self.session.generate_reply(tool_choice="auto")
      
     async def _run_detection(self, context: Optional[RunContext_T] = None) -> str:
         userdata = self.session.userdata if context is None else context.userdata
@@ -220,10 +220,14 @@ class ObjectDetectionAgent(BaseAgent):
     
     @function_tool()
     async def to_depth_estimation(self, context: RunContext_T) -> tuple[Agent, str]:
+        """Call this when user wants to estimate distance to the detected object. Use when user says yes, sure, please do, go ahead, or similar confirmation."""
+        logger.info("Function tool 'to_depth_estimation' called - transferring to DepthEstimationAgent")
         return await self._transfer_to_agent("depth_estimation", context)
     
     @function_tool()
     async def to_rag(self, context: RunContext_T) -> tuple[Agent, str]:
+        """Call this when user wants to check the knowledge base for object location. Use when object is not found or user asks to search knowledge base."""
+        logger.info("Function tool 'to_rag' called - transferring to RAGAgent")
         return await self._transfer_to_agent("rag", context)
 
 class RAGAgent(BaseAgent):
@@ -250,31 +254,39 @@ class DepthEstimationAgent(BaseAgent):
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.depth_model.to(self.device)
-        logger.info(f"ZoeDepth loaded on {self.device}")
+        logger.info(f"ZoeDepth model loaded on {self.device}")
 
     async def on_enter(self) -> None:
         await super().on_enter(generate_reply=False)
-        message = await self.estimate_depth()
+        
+        # Run depth estimation
+        message = await self._estimate_depth()
         await self.session.say(message)
         
         # Enable function tool calling for user's next response
-        self.session.generate_reply()
+        self.session.generate_reply(tool_choice="auto")
 
-    async def estimate_depth(self, context: Optional[RunContext_T] = None) -> str:
-        """Called when user wants to estimate the distance to the object"""
+    async def _estimate_depth(self, context: Optional[RunContext_T] = None) -> str:
+        """Run depth estimation on the detected object"""
         userdata = self.session.userdata if context is None else context.userdata
         object_to_find = userdata.object_to_find
         image_path = userdata.object_image
         box = userdata.detected_box # [x1, y1, x2, y2]
 
+        logger.info(f"Starting depth estimation for {object_to_find}")
+
         if not object_to_find or not image_path or not box:
+            logger.warning("Missing required data for depth estimation")
             return "I need a confirmed object detection to gauge distance."
 
         try:
             # 1. Load Image
+            logger.info(f"Loading image from {image_path}")
             pil_image = Image.open(image_path).convert("RGB")
+            logger.info(f"Image loaded: {pil_image.width}x{pil_image.height}")
             
             # 2. Generate Depth Map
+            logger.info("Generating depth map...")
             inputs = self.depth_processor(images=pil_image, return_tensors="pt").to(self.device)
             with torch.no_grad():
                 outputs = self.depth_model(**inputs)
@@ -283,32 +295,38 @@ class DepthEstimationAgent(BaseAgent):
                 outputs, source_sizes=[(pil_image.height, pil_image.width)]
             )[0]
             depth_map = post_processed["predicted_depth"].cpu().numpy()
+            logger.info(f"Depth map generated: shape {depth_map.shape}")
 
             # 3. Extract Distance for the specific box
             x1, y1, x2, y2 = map(int, box)
+            logger.info(f"Object bounding box: [{x1}, {y1}, {x2}, {y2}]")
             
             # Clamp coordinates
             x1, x2 = max(0, x1), min(pil_image.width, x2)
             y1, y2 = max(0, y1), min(pil_image.height, y2)
+            logger.info(f"Clamped box coordinates: [{x1}, {y1}, {x2}, {y2}]")
             
             object_depth_region = depth_map[y1:y2, x1:x2]
             
             if object_depth_region.size == 0:
-                 return f"I see the {object_to_find}, but I can't get a clear depth reading."
+                logger.warning("Empty depth region after cropping")
+                return f"I see the {object_to_find}, but I can't get a clear depth reading."
 
             # Calculate Median Distance
             distance = np.median(object_depth_region)
             distance_str = f"{distance:.2f}"
+            logger.info(f"Calculated distance: {distance_str} meters")
 
             return f"The {object_to_find} is about {distance_str} meters away. Close in carefully. Need anything else?"
 
         except Exception as e:
-            logger.error(f"Depth error: {e}")
+            logger.error(f"Depth estimation error: {e}", exc_info=True)
             return "I'm having trouble reading the depth sensors right now."
     
     @function_tool()
     async def search_new_object(self, context: RunContext_T) -> tuple[Agent, str]:
-        """Transfer back to greeting agent to search for a new object"""
+        """Call this when user wants to search for a different object. Use when user says they want to find something else or start a new search."""
+        logger.info("Function tool 'search_new_object' called - resetting and transferring to Greeting")
         # Reset userdata for new search
         context.userdata.object_to_find = None
         context.userdata.user_location = None
@@ -317,7 +335,8 @@ class DepthEstimationAgent(BaseAgent):
     
     @function_tool()
     async def end_session(self, context: RunContext_T) -> str:
-        """End the navigation session"""
+        """Call this when user wants to end the session or says goodbye, thank you, that's all, I'm done, or similar."""
+        logger.info("Function tool 'end_session' called - ending navigation")
         return "Navigation complete. Have a great day!"
 
 
