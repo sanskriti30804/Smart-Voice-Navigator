@@ -19,6 +19,9 @@ from sentence_transformers import SentenceTransformer, util
 import os
 import json
 import asyncio
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -46,7 +49,7 @@ RunContext_T = RunContext[UserData]
 
 
 class BaseAgent(Agent):
-    async def on_enter(self) -> None:
+    async def on_enter(self, generate_reply: bool = True) -> None:
         agent_name = self.__class__.__name__
         logger.info(f"entering task {agent_name}")
 
@@ -68,7 +71,8 @@ class BaseAgent(Agent):
             content=f"You are {agent_name} agent. Current user data is {userdata.summarize()}",
         )
         await self.update_chat_ctx(chat_ctx)
-        self.session.generate_reply(tool_choice="none")
+        if generate_reply:
+            self.session.generate_reply(tool_choice="none")
 
     async def _transfer_to_agent(self, name: str, context: Optional[RunContext_T] = None) -> tuple[Agent, str]:
         if context is None:
@@ -134,7 +138,9 @@ class ObjectDetectionAgent(BaseAgent):
     def __init__(self) -> None:
         super().__init__(
             instructions=(
-                "You handle rapid object detection. Use the latest image and target name from userdata"
+                "You handle rapid object detection. Wait for the detection results. "
+                "After detection, facilitate the next steps, offer to estimate distance if found, or suggest checking the knowledege base if not found. Listen for user's confirmation before proceeding. "
+                "Do not speak until detection is complete."
             ),
         )
         # Load models once at startup to avoid re-loading latency
@@ -144,7 +150,7 @@ class ObjectDetectionAgent(BaseAgent):
         logger.info("Models loaded.")
     
     async def on_enter(self) -> None:
-        await super().on_enter()
+        await super().on_enter(generate_reply=False)
         
         # Run detection
         message = await self._run_detection() 
@@ -160,7 +166,8 @@ class ObjectDetectionAgent(BaseAgent):
         def run_yolo():
             return self.yolo_model(userdata.object_image)
 
-        results = await asyncio.to_thread(run_yolo)
+        # results = await asyncio.to_thread(run_yolo)
+        results = run_yolo() # trying without thread for now
 
         names = []
         for result in results:
@@ -179,7 +186,8 @@ class ObjectDetectionAgent(BaseAgent):
             predicted_embeddings = self.embedding_model.encode(names, convert_to_tensor=True)
             return util.cos_sim(query_embedding, predicted_embeddings)[0]
 
-        similarities = await asyncio.to_thread(calculate_similarity)
+        # similarities = await asyncio.to_thread(calculate_similarity)
+        similarities = calculate_similarity() # trying without thread for now
         
         best_idx = int(similarities.argmax())
         best_match = names[best_idx]
@@ -189,18 +197,14 @@ class ObjectDetectionAgent(BaseAgent):
 
         if best_score >= 0.5: # Adjusted threshold
             userdata.object_found = True
-            return (
-                f"I found {best_match}, which looks like your {target}. Want me to estimate the distance?"
-            )
+            logger.info(f'Object Found: {userdata.object_found}')
+            return f"I found {best_match}, which looks like your {target}. Want me to estimate the distance to it?"
         
         userdata.object_found = False
+        logger.info(f'Object Found: {userdata.object_found}')
         return (
             f"I see {', '.join(names[:3])}, but nothing matching {target}. Should I check the knowledge base?"
         )
-
-    @function_tool()
-    async def detect_object(self, context: RunContext_T) -> tuple[Agent, str]:
-        return await self._run_detection(context)
     
     @function_tool()
     async def to_depth_estimation(self, context: RunContext_T) -> tuple[Agent, str]:
@@ -223,22 +227,37 @@ class DepthEstimationAgent(BaseAgent):
     def __init__(self) -> None:
         super().__init__(
             instructions=(
-                "You estimate distance to the detected object. Use userdata for the target and latest image"
+                "You estimate distance to the detected object and provide navigation guidance. "
+                "After providing the distance, ask if the user needs further assistance or wants to search for another object. "
+                "Keep responses brief and actionable."
             ),
         )
     async def on_enter(self) -> None:
-        await super().on_enter()
+        await super().on_enter(generate_reply=False)
         message = await self.estimate_depth()
         await self.session.say(message)
 
-
     async def estimate_depth(self, context: Optional[RunContext_T] = None) -> str:
         """Called when user wants to estimate the distance to the object"""
-        userdata = userdata = self.session.userdata if context is None else context.userdata
+        userdata = self.session.userdata if context is None else context.userdata
         object_to_find = userdata.object_to_find
         image = userdata.object_image
         predicted_depth = 10
-        return f"{object_to_find} is about {predicted_depth} meters ahead. Close in carefully." if object_to_find else "Can't gauge distance without a target."
+        return f"{object_to_find} is about {predicted_depth} meters ahead. Close in carefully. Need anything else?" if object_to_find else "Can't gauge distance without a target."
+    
+    @function_tool()
+    async def search_new_object(self, context: RunContext_T) -> tuple[Agent, str]:
+        """Transfer back to greeting agent to search for a new object"""
+        # Reset userdata for new search
+        context.userdata.object_to_find = None
+        context.userdata.user_location = None
+        context.userdata.object_found = False
+        return await self._transfer_to_agent("greeter", context)
+    
+    @function_tool()
+    async def end_session(self, context: RunContext_T) -> str:
+        """End the navigation session"""
+        return "Navigation complete. Have a great day!"
 
 
 async def entrypoint(ctx: agents.JobContext):
@@ -283,5 +302,28 @@ async def entrypoint(ctx: agents.JobContext):
 
     await ctx.connect()
 
-if __name__ == "__main__":
+# ----------------------------
+# Minimal health server
+# ----------------------------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/healthz":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def start_health_server():
+    http_server = HTTPServer(("0.0.0.0", 4000), HealthHandler)
+    thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+    thread.start()
+
+if __name__ == "__main__":  
+    # Start lightweight health server
+    start_health_server()
+
+    # Boot LiveKit agent
     agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
