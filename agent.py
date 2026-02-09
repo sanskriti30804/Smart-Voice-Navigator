@@ -6,8 +6,6 @@ from livekit.plugins import (
     noise_cancellation,
     silero,
     sarvam,
-    google,
-    openai,
     )
 from livekit.agents.llm import function_tool
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -38,6 +36,8 @@ class UserData:
     object_image: Optional[str] = None
     detected_box: Optional[List[float]] = None
     prev_agent: Optional[Agent] = None
+    preferred_language: Optional[str] = None
+    preferred_language_code: Optional[str] = "en-IN"
     agents: dict[str, Agent] = field(default_factory=dict)
 
     def summarize(self) -> str:
@@ -71,9 +71,13 @@ class BaseAgent(Agent):
             chat_ctx.items.extend(items_copy)
 
         # add an instructions including the user data as assistant message
+        language_instruction = ""
+        if userdata.preferred_language and userdata.preferred_language.lower() != "english":
+            language_instruction = f" IMPORTANT: Always respond in {userdata.preferred_language} language, not English."
+        
         chat_ctx.add_message(
             role="system",  # role=system works for OpenAI's LLM and Realtime API
-            content=f"You are {agent_name} agent. Current user data is {userdata.summarize()}",
+            content=f"You are {agent_name} agent. Current user data is {userdata.summarize()}.{language_instruction}",
         )
         await self.update_chat_ctx(chat_ctx)
         if generate_reply:
@@ -98,8 +102,11 @@ class Greeting(BaseAgent):
     def __init__(self) -> None:
         super().__init__(
             instructions=(
-                "You're a calm, real-time smart voice navigator based inside a user's house. Collect the user's target item and user's location, confirm what you heard,"
-                " and let them know exactly what you're doing next. Keep responses short, actionable, and conversational."
+                "You're a calm, real-time smart voice navigator based inside a user's house. "
+                "Collect the user's target item, user's location and preferred language, confirm what you heard. "
+                "Once you have ALL THREE pieces of information (object, location, AND language), call the start_detection tool to begin scanning. "
+                "CRITICAL: Once user provides their preferred language, ALWAYS respond in that language (not English). "
+                "Keep responses short, actionable, and conversational."
             ),
         )
     
@@ -107,37 +114,104 @@ class Greeting(BaseAgent):
     async def update_object_to_find(
         self, 
         object_to_find: Annotated[str, Field(description="The object the user wants to find")], 
-        context: RunContext_T) -> str | tuple[Agent, str]:
+        context: RunContext_T) -> str:
         """Called when user provides the object they want to find"""
         userdata = context.userdata
         target = object_to_find.strip()
         userdata.object_to_find = target
 
-        if userdata.user_location:
-            next_agent, _ = await self._transfer_to_agent("object_detection", context)
-            return next_agent, (
-                f"Locked onto {target}. You're in {userdata.user_location}, so I'm spinning up detection now."
-            )
-
-        return "Locked onto {target}. Give me your current location so I can route you through the quickest path.".format(target=target)
+        missing = []
+        if not userdata.user_location:
+            missing.append("location")
+        if not userdata.preferred_language_code or userdata.preferred_language_code == "en-IN":
+            missing.append("preferred language")
+        
+        if missing:
+            return f"Locked onto {target}. Please also provide your {' and '.join(missing)}."
+        
+        return f"Locked onto {target}."
 
     @function_tool()
     async def update_user_location(
         self, 
         user_location: Annotated[str, Field(description="The location of the user")], 
-        context: RunContext_T) -> str | tuple[Agent, str]:
+        context: RunContext_T) -> str:
         """Called when user provides their location"""
         userdata = context.userdata
         location = user_location.strip()
         userdata.user_location = location
 
-        if userdata.object_to_find:
-            next_agent, _ = await self._transfer_to_agent("object_detection", context)
-            return next_agent, (
-                f"Copy that, you're in {location}. Scanning for {userdata.object_to_find} now."
-            )
+        missing = []
+        if not userdata.object_to_find:
+            missing.append("object to find")
+        if not userdata.preferred_language_code or userdata.preferred_language_code == "en-IN":
+            missing.append("preferred language")
+        
+        if missing:
+            return f"Noted—{location}. Please also tell me the {' and '.join(missing)}."
+        
+        return f"Noted—{location}."
+    
+    @function_tool()
+    async def update_user_preferred_language(
+        self, 
+        preferred_language: Annotated[str, Field(description="The user's preferred language for communication")], 
+        context: RunContext_T) -> str:
+        """Called when user provides their preferred language"""
+        userdata = context.userdata
+        language = preferred_language.strip()
 
-        return f"Noted—{location}. Tell me what you're hunting for and I'll spin up the right tools."
+        # Map common language names to Sarvam API language codes
+        language_mapping = {
+            "english": "en-IN",
+            "hindi": "hi-IN",
+            "bengali": "bn-IN",
+            "kannada": "kn-IN",
+            "malayalam": "ml-IN",
+            "marathi": "mr-IN",
+            "odia": "od-IN",
+            "punjabi": "pa-IN",
+            "tamil": "ta-IN",
+            "telugu": "te-IN",
+            "gujarati": "gu-IN",
+        }
+        language_code = language_mapping.get(language.lower(), "unknown")  # default to "unknown" if not found for API to detect
+        userdata.preferred_language = language
+        userdata.preferred_language_code = language_code
+
+        missing = []
+        if not userdata.object_to_find:
+            missing.append("object to find")
+        if not userdata.user_location:
+            missing.append("location")
+        
+        if missing:
+            return f"Got it, I'll communicate in {language}. Please also provide your {' and '.join(missing)}."
+        
+        return f"Got it, I'll communicate in {language}."
+    
+    @function_tool()
+    async def start_detection(
+        self, 
+        context: RunContext_T) -> tuple[Agent, str] | str:
+        """Call this to start object detection when all required information (object, location, language) has been collected. Only call this when you have confirmed all three pieces of information from the user."""
+        userdata = context.userdata
+        
+        # Validate all required fields are present
+        if not userdata.object_to_find or not userdata.user_location or not userdata.preferred_language_code:
+            missing = []
+            if not userdata.object_to_find:
+                missing.append("object to find")
+            if not userdata.user_location:
+                missing.append("location")
+            if not userdata.preferred_language_code or userdata.preferred_language_code == "en-IN":
+                missing.append("preferred language")
+            return f"I still need: {', '.join(missing)}. Please provide this information first."
+        
+        next_agent, _ = await self._transfer_to_agent("object_detection", context)
+        return next_agent, (
+            f"Perfect! Scanning for {userdata.object_to_find} in {userdata.user_location} now."
+        )
 
 class ObjectDetectionAgent(BaseAgent):
     def __init__(self) -> None:
@@ -145,6 +219,7 @@ class ObjectDetectionAgent(BaseAgent):
             instructions=(
                 "You handle rapid object detection. Wait for the detection results. "
                 "After detection, facilitate the next steps, offer to estimate distance if found, or suggest checking the knowledege base if not found. Listen for user's confirmation before proceeding. "
+                "CRITICAL: Always respond in the user's preferred language. "
                 "Do not speak until detection is complete."
             ),
         )
@@ -157,11 +232,18 @@ class ObjectDetectionAgent(BaseAgent):
     async def on_enter(self) -> None:
         await super().on_enter(generate_reply=False)
         
-        # Run detection
-        message = await self._run_detection() 
-        await self.session.say(message)
+        # Run detection and add result to chat context for LLM to translate
+        message = await self._run_detection()
         
-        # Enable function tool calling for user's next response
+        # Add detection result to chat context
+        chat_ctx = self.chat_ctx.copy()
+        chat_ctx.add_message(
+            role="system",
+            content=f"Detection complete. Result: {message}. Now communicate this result to the user in their preferred language."
+        )
+        await self.update_chat_ctx(chat_ctx)
+        
+        # Let LLM generate translated response
         self.session.generate_reply(tool_choice="auto")
      
     async def _run_detection(self, context: Optional[RunContext_T] = None) -> str:
@@ -235,7 +317,8 @@ class RAGAgent(BaseAgent):
         super().__init__(
             instructions=(
                 "You're the fallback navigator. Pull from building knowledge to guide the user to the target"
-                " if detection missed it. Be definitive about directions and confirm next steps."
+                " if detection missed it. Be definitive about directions and confirm next steps. "
+                "CRITICAL: Always respond in the user's preferred language."
             ),
         )
 
@@ -245,6 +328,7 @@ class DepthEstimationAgent(BaseAgent):
             instructions=(
                 "You handle distance estimation to detected objects. Wait for the depth estimation results. "
                 "After estimation, ask if the user needs further assistance or wants to search for another object. "
+                "CRITICAL: Always respond in the user's preferred language. "
                 "Do not speak until estimation is complete."
             ),
         )
@@ -259,11 +343,16 @@ class DepthEstimationAgent(BaseAgent):
     async def on_enter(self) -> None:
         await super().on_enter(generate_reply=False)
         
-        # Run depth estimation
+        # Run depth estimation and add result to chat context for LLM to translate
         message = await self._estimate_depth()
-        await self.session.say(message)
         
-        # Enable function tool calling for user's next response
+        # Add depth result to chat context
+        chat_ctx = self.chat_ctx.copy()
+        chat_ctx.add_message(
+            role="system",
+            content=f"Depth estimation complete. Result: {message}. Now communicate this result to the user in their preferred language."
+        )
+        await self.update_chat_ctx(chat_ctx)
         self.session.generate_reply(tool_choice="auto")
 
     async def _estimate_depth(self, context: Optional[RunContext_T] = None) -> str:
@@ -358,13 +447,13 @@ async def entrypoint(ctx: agents.JobContext):
     )
 
     session = AgentSession(
-        stt = openai.STT(
-        model="gpt-4o-transcribe",
-        language="en",
-        ),  
-        llm=google.LLM(model="gemini-3-flash-preview"),
+        stt = sarvam.STT(
+            model="saarika:v2.5",
+            language=userdata.preferred_language_code
+        ),
+        llm="google/gemini-3-flash",
         tts=sarvam.TTS(
-            target_language_code="en-IN",
+            target_language_code=userdata.preferred_language_code,
             speaker="hitesh"
         ),
         vad=silero.VAD.load(),
